@@ -1,0 +1,376 @@
+package com.meiah.webCrawlers;
+
+import java.util.ArrayList;
+import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+import org.apache.log4j.Logger;
+
+import com.meiah.htmlParser.LinkExtractor;
+import com.meiah.htmlParser.ListPageDecider;
+import com.meiah.linkfilters.ExcludeStrFilter;
+import com.meiah.linkfilters.FileExtensionFilter;
+import com.meiah.linkfilters.LinkFilter;
+import com.meiah.linkfilters.LinkFilterUtil;
+import com.meiah.linkfilters.LocalLinkFilter;
+import com.meiah.po.Link;
+import com.meiah.po.RunningTask;
+import com.meiah.po.SiteConfig;
+import com.meiah.po.Task;
+import com.meiah.po.TaskLink;
+import com.meiah.po.WebPage;
+import com.meiah.util.Config;
+import com.meiah.util.JavaUtil;
+import com.meiah.util.SysConstants;
+import com.meiah.util.SysObject;
+import com.meiah.util.WebPageDownloader;
+
+/**
+ * @author huhb
+ * @date Nov 19, 2010
+ * @功能 页面爬取器，功能下载html页面，获取其中的超链接，加入待爬取链接
+ *     当爬取到一定数量的页面时通知页面解析器（PageResolver）解析下载后的页面
+ */
+public class PageCrawler extends Thread {
+	protected Logger logger = Logger.getLogger(PageCrawler.class);
+	public static AtomicInteger pageCount = new AtomicInteger(0);
+	public static AtomicLong totalTime = new AtomicLong(0);
+	protected Task task;// 任务
+	protected TaskLink link;// 标志当前下载页面的链接
+	protected RunningTask rtask;
+
+	public PageCrawler(TaskLink link, Task task) {
+		this.task = task;
+		rtask = (RunningTask) task;
+		this.link = link;
+
+	}
+
+	public void run() {
+
+		SysObject.crawlThreads.incrementAndGet();
+		mainPro();
+		SysObject.crawlThreads.decrementAndGet();
+
+	}
+
+	protected void mainPro() {
+		pageCount.incrementAndGet();
+		int save_BatchCount = Config.getSave_BatchCount();
+		rtask = (RunningTask) task;
+		long starttime = System.currentTimeMillis();
+		String webContent = getPageContent();
+		long useTime = System.currentTimeMillis() - starttime;
+		totalTime.addAndGet(useTime);
+		if (webContent.length() < 100) {
+			logger.warn("网页内容过短？！:" + link.getUrl());
+			return;
+		}
+		long t = System.currentTimeMillis();
+		addLink(webContent);
+		if (logger.isDebugEnabled())
+			logger.debug("add link took: " + (System.currentTimeMillis() - t) + " ms");
+		WebPage page = new WebPage(link, webContent);
+		if (link.getLevel() > SysConstants.INIT_LEVEL)
+			SysObject.addPage(page);// 将爬取后的页面信息，加入的缓存队列
+		if (SysObject.getPageSize() >= save_BatchCount) {
+			// 如果缓存队列中的页面数超过指定的数目则 启动解析线程进行解析
+			if (task.pluginMode == true) {
+				PageResolver reslover;
+				try {
+					reslover = PluginFactory.getInstance().getPageResolver(task);
+					reslover.start();
+				} catch (Exception e) {
+					logger.error("", e);
+				}
+
+			} else {
+				new PageResolver(task).start();// 任务结束时有可能还有缓存的页面未解析，此次保存
+			}
+
+		}
+		rtask.setDownloadPages(rtask.getDownloadPages() + 1);
+	}
+
+	public synchronized void start() {
+		super.start();
+	}
+
+	/**
+	 * 抓取html页面源代码，如果需要，设置cookie、验证转向
+	 * 
+	 * @return
+	 */
+	protected String getPageContent() {
+
+		String webContent = "";
+		String downloadUrl = link.getUrl();
+		WebPageDownloader downloader = new WebPageDownloader(downloadUrl);
+		downloader.setCheckCookie(true);
+		downloader.setCookieStr(task.getUcookies());
+		downloader.setCheckRedirect(true);
+		if (task.getProxyurl() != null && task.getProxyurl().length() > 0) {
+			downloader.setUseProxyIf(true);
+			downloader.setProxyUrl(task.getProxyurl());
+			downloader.setProxyPort(task.getProxyport());
+			downloader.setProxyUser(task.getProxyuser());
+			downloader.setProxyPwd(task.getProxypwd());
+		}
+
+		try {
+			webContent = downloader.getPageContent();
+			if (logger.isDebugEnabled())
+				logger.debug(webContent);
+			if (link.getLevel() == SysConstants.INIT_LEVEL
+					&& webContent.indexOf("t3_ar_guard()") != -1) {
+				try {
+					String[] cookieInfo = JavaUtil.match(webContent, "(?is)(ant_stream_.*?)\\|path\\|(\\d+)\\|(\\d+)");
+					String cookie = cookieInfo[1] + "=" + cookieInfo[3] + "/" + cookieInfo[2];
+					task.setUcookies(cookie);
+					downloader.setCookieStr(cookie);
+					webContent = "";
+					webContent = downloader.getPageContent();
+				} catch (Exception e) {
+				}
+			}
+			String cookie = downloader.getCookieGot();
+			if (cookie != null && cookie.length() > 0) {
+				task.setUcookies(cookie);
+				logger.info(link.getUrl() + ":设置cookie: " + task.getUcookies());
+			}
+			String redirectUrl = downloader.getRedirectUrl();
+			// if (redirectUrl != null && !redirectUrl.equals("")
+			// && SysObject.isExistsUrl(redirectUrl)
+			// && !redirectUrl.equals(link.getUrl())) {
+			// // 如果转向后的链接已经抓取过则忽略该链接
+			// return "";
+			// }
+			if (redirectUrl != null && !redirectUrl.equals("")
+					&& downloadUrl.equals(task.getUrl())) {// 如果在任务url（一般为网站的主页），存在跳转，则添加跳转后的超链接为任务的前缀
+				link.setUrl(redirectUrl);
+				if (redirectUrl.substring(9).indexOf("/") == -1)
+					redirectUrl = redirectUrl + "/";
+				String prefix = redirectUrl.substring(0, redirectUrl
+						.lastIndexOf("/") + 1);
+				if (task.getPrefix() != null && !task.getPrefix().equals("")) {
+					task.setPrefix(task.getPrefix() + "," + prefix);
+				} else {
+					task.setPrefix(prefix);
+				}
+				logger.warn("任务添加前缀: " + prefix + "  在链接：" + downloadUrl);
+
+			}
+		} catch (Exception e) {
+			logger.warn("下载网页 " + downloadUrl + " 出现异常：" + e.getMessage());
+		}
+
+		return webContent;
+	}
+
+	// protected void addLinkOneLevel(String webContent) {
+	// if (this.link.getLevel() == SysConstants.INIT_LEVEL) {
+	// ArrayList<TaskLink> urlList = extractTaskLinks(webContent, task,
+	// link);
+	// for (int i = 0; i < urlList.size(); i++) {
+	// TaskLink link = urlList.get(i);
+	// String urlTobeAdd = link.getUrl();
+	// if (!SysObject.existsUrl(urlTobeAdd)) {
+	// if (ListUrlFilter.isLinkExist(link) == ListUrlFilter.EXIST) {
+	// // if (logger.isDebugEnabled()){
+	// logger.info("链接：" + link.getTitle() + ":" + urlTobeAdd
+	// + "抓取过,并且是第一层列表页");
+	// // }
+	// continue;
+	// }
+	// if (!ClientCenter.isNewsExist(link.getUrl())) {
+	// // 通过排重中心看看链接是不是已经下载过的新闻
+	// link.setLinkType(detectLinkType(link, task));
+	// SysObject.addLink(link);
+	// } else {
+	// if (logger.isDebugEnabled()) {
+	// logger.debug("链接：" + link.getTitle() + ":"
+	// + urlTobeAdd + "抓取过,并且是正文页");
+	// }
+	//
+	// }
+	// }
+	//
+	// }
+	// }
+	// }
+
+	protected void addLink(String webContent) {
+		if (this.link.getLevel() < this.task.getMaxLevel()) {
+			//过滤需要进行抓取的链接
+			ArrayList<TaskLink> urlList = extractTaskLinks(webContent, task, link);
+			if (logger.isDebugEnabled()) {
+				logger.debug("extractTaskLinks,size:" + urlList.size());
+			}
+			for (int i = 0; i < urlList.size(); i++) {
+				TaskLink link = urlList.get(i);
+				String urlTobeAdd = link.getUrl();
+				link.setLinkType(detectLinkType(link, task));
+				if (logger.isDebugEnabled()) {
+					logger.debug("链接：" + link.getTitle() + ":" + urlTobeAdd + link.getLinkType());
+				}
+				if (task.getMaxLevel() == 1 && link.getLinkType() == SysConstants.PAGETYPE_LIST) {
+					logger.debug("first lever list page,ignore!");
+					continue;
+				}
+				if (!SysObject.existsUrl(urlTobeAdd)) {
+					if (!ClientCenter.isNewsExist(link.getUrl())) {
+						// 通过排重中心看看链接是不是已经下载过的新闻
+						SysObject.addLink(link);
+					} else {
+						if (logger.isDebugEnabled()) {
+							logger.debug("链接：" + link.getTitle() + ":" + urlTobeAdd + "抓取过,并且是正文页");
+						}
+					}
+				}
+			}
+		}
+		if (this.link.getUrl().equals(task.getUrl()) && this.link.getLevel() == SysConstants.INIT_LEVEL) {
+			logger.info("任务页面添加链接数：" + SysObject.getQueueSize());
+		}
+	}
+
+	/**
+	 * @param 传入链接
+	 * @return 是否正文页面
+	 */
+	protected int detectLinkType(TaskLink link, Task task) {
+		String url = link.getUrl();
+		SiteConfig siteConfig = task.getSiteConfig();
+		int ret = SysConstants.PAGETYPE_UNKNOWN;
+		if (siteConfig != null) {
+			// 插件模式
+			String newsUrlPatterns = siteConfig.getContentUrlRegex();
+			if (newsUrlPatterns != null && !newsUrlPatterns.trim().equals("")) {
+				String[] patterns = newsUrlPatterns.split(SiteConfig.SPLITER);
+				for (String pattern : patterns) {
+					if (JavaUtil.isAllMatch(url, pattern.trim()))
+						ret = SysConstants.PAGETYPE_CONTENT;
+				}
+				if (ret != SysConstants.PAGETYPE_CONTENT)
+					ret = SysConstants.PAGETYPE_LIST;
+			}
+		} else if (task.getPageType() != null && task.getPageType().trim().length() > 0) {
+			// 非插件模式，但是有配置pageType
+			if (isContentPage(link.getUrl(), task.getPageType()))
+				ret = SysConstants.PAGETYPE_CONTENT;
+			else
+				ret = SysConstants.PAGETYPE_LIST;
+		}
+		return ret;
+	};
+
+	/**
+	 * @param 传入链接
+	 * @return 是否正文页面
+	 */
+	public static boolean isContentPage(String url, String pageType) {
+		boolean flag = false;
+		if (pageType != null && pageType.length() != 0) {
+			String[] contentRegexs = pageType.split(ListPageDecider.SPLITER);
+			for (int i = 0; i < contentRegexs.length; i++) {
+				String contentRegex = contentRegexs[i];
+				contentRegex = contentRegex.substring("content:".length()).trim();
+				contentRegexs[i] = contentRegex;
+				if (contentRegex.length() != 0 && JavaUtil.isAllMatch(url, contentRegex)) {
+					flag = true;
+					break;
+				}
+			}
+		}
+		return flag;
+	};
+
+	/**
+	 * 过滤提取在当前html页面下需要进行抓取的链接：规则
+	 * <ol>
+	 * <li>站内url，或者在任务前缀下的url（任务url为默认前缀）
+	 * <li>不包含排除字符串的url，如：print.html
+	 * <li>以其他文档类型为结束的ur 如：.txt,.doc,.mp3等等
+	 * </ol>
+	 * 
+	 * @param webContent
+	 *            超文本内容
+	 * @param task
+	 *            任务设置
+	 * @param link
+	 *            当前页面链接信息
+	 */
+	protected ArrayList<TaskLink> extractTaskLinks(String webContent, Task task, TaskLink link) {
+		if (logger.isDebugEnabled()) {
+			logger.debug("extracting TaskLinks");
+		}
+		ArrayList<TaskLink> urlList = new ArrayList<TaskLink>();
+
+		String prefix = task.getPrefix();
+		String[] localSitePrefixs = prefix.split(",");
+		LinkFilter LocalLinkFilter = new LocalLinkFilter(localSitePrefixs);// 过滤器，保留站点内和任务前缀下的超链接
+
+		String[] fileExtetions = ".xls,.xml,.txt,.jpg,.mp3,.mp4,.doc,xls,xlsx,.mpg,.mpeg,.jpeg,.gif,.png,.js,.zip,.pdf,.wps,doc,docx,.rar,.exe,.swf,.rm,.ra,.asf,.css,.apk,.bmp,.z,.gz,.tar,.cpio,.class,.jsp,.tif,.ppt".split(",");
+		LinkFilter fileExtetionFilter = new FileExtensionFilter(fileExtetions);
+		LinkFilter noFileExtetionFilter = LinkFilterUtil.not(fileExtetionFilter);// 过滤器，过滤掉非文本的一些的超链接
+
+		String excludeStr = task.getSubstr();
+		LinkFilter excludeStrFilter = new ExcludeStrFilter(excludeStr);
+		LinkFilter noExcludeStrFilter = LinkFilterUtil.not(excludeStrFilter);// 过滤器，保留不包含排除字符串的超链接
+		LinkFilter[] filters = new LinkFilter[] { LocalLinkFilter, noFileExtetionFilter, noExcludeStrFilter };
+
+		LinkFilter taskLinkFilter = LinkFilterUtil.and(filters);
+		Link l = (Link) link;
+
+		ArrayList<Link> links = LinkExtractor.getPageUrlListByParser(l, webContent, taskLinkFilter);
+		for (int i = 0; i < links.size(); i++) {
+			TaskLink tl = new TaskLink(links.get(i));
+			String title = fixTitle(link, tl.getTitle(), webContent);// 对于超链接标题的一个处理
+			tl.setTitle(title);
+			tl.setTaskid(task.getTaskid());
+			tl.setLevel(link.getLevel() + 1);
+			urlList.add(tl);
+		}
+		return urlList;
+	}
+
+	protected String fixTitle(TaskLink link, String title, String webContent) {
+		try {
+			if (link.getTitle() == null || link.getTitle().equals("")) {
+				String temp[] = JavaUtil.match(webContent, "(?s)(?i)<title.*?>(.*?)</title>");
+				if (temp != null && temp.length > 0) {
+					String pageTitle = temp[1];
+					link.setTitle(pageTitle);
+				}
+			}
+			String temp = title.replaceAll("&nbsp;?", "").replaceAll("\\pP", "").trim();
+			if (temp.matches("\\d{1,2}|<|>|>>|<<")) {
+				title = link.getTitle() + title;
+				return title;
+			} else if (temp.matches("\\d{3,}")) {
+				return "";
+			} else if (temp.matches("下一页")) {
+				String tempTitle = link.getTitle();
+				if (tempTitle.matches("(.*?)(\\d+)")) {
+					String titleS = JavaUtil.match(tempTitle, "(.*?)(\\d+)")[1];
+					int page = Integer.parseInt(JavaUtil.match(tempTitle, "(.*?)(\\d+)")[2]);
+					title = titleS + (page + 1);
+					return title;
+				} else {
+					String titleS = tempTitle;
+					title = titleS + "2";
+					return title;
+				}
+			} else {
+				return title;
+			}
+		} catch (Exception e) {
+			logger.error("修复标题出现异常：" + link.getUrl(), e);
+			return title;
+		}
+	}
+
+	public static void main(String[] args) throws Exception {}
+
+}

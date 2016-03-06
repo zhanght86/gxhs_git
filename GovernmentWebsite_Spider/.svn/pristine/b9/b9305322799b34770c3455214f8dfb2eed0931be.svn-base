@@ -1,0 +1,42 @@
+﻿SpotID=0000000000006714
+cid=1
+#========================================
+# 任务服务器数据库配置
+user=sa
+password=meiahpicoyk
+url=jdbc:sqlserver://192.168.20.133:1433;DatabaseName=kaifa
+driver=com.microsoft.sqlserver.jdbc.SQLServerDriver
+#========================================
+
+#========================================
+# 本机爬虫数据库配置
+localuser=sa
+localpassword=Meiya@2015
+localurl=jdbc:sqlserver://192.168.20.124:1433;DatabaseName=ceshi
+localdriver=com.microsoft.sqlserver.jdbc.SQLServerDriver
+#========================================
+
+
+#========================================
+# 本地IP设置
+localIp=172.16.1.47
+serverIp=194.84.67.3
+serverPort=39578
+#========================================
+#indexon=1
+
+
+isProxyTaskServer=0
+
+maxproc=10
+
+Save_BatchCount=1
+
+#dateDelayToDeleteData
+deldays=30
+#======index文件存放路径=================
+fileSavePath = D:/news_data
+
+#===============代理ip服务器设置=====================
+proxyCenterUrl=192.168.20.124
+proxyCenterPort=8012
